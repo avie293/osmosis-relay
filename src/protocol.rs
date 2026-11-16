@@ -2,30 +2,70 @@
 //!
 //! Frames are a VarInt length followed by the payload. A payload starts with a one byte packet id, followed by the
 //! fields in order. Field encodings match Minecraft's `FriendlyByteBuf`: VarInts for counts and lengths, UUIDs as
-//! 16 big-endian bytes, strings as a VarInt byte length plus UTF-8 and booleans as one byte.
+//! 16 big-endian bytes, strings and byte arrays as a VarInt length plus the bytes, `u64`s as 8 big-endian bytes and
+//! booleans as one byte.
+//!
+//! Chat messages are end-to-end encrypted by the clients. The server only stores and forwards the nonce and
+//! ciphertext and never sees a key it could decrypt them with.
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bumped whenever a change would break older clients.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// Upper bound for frames sent by clients. Nothing a client sends today comes close to this.
-pub const MAX_CLIENT_FRAME: usize = 1024;
+/// Upper bound for frames sent by clients. The largest one is a chat message.
+pub const MAX_CLIENT_FRAME: usize = 8 * 1024;
 
 pub const MAX_NAME_LENGTH: usize = 16;
+pub const MAX_KEY_LENGTH: usize = 64;
+pub const MAX_CIPHERTEXT_LENGTH: usize = 4096;
+pub const NONCE_LENGTH: usize = 12;
+pub const MAX_HISTORY_PAGE: usize = 50;
+
+pub type Nonce = [u8; NONCE_LENGTH];
 
 pub type Uuid = u128;
 
 #[derive(Debug)]
 pub enum Serverbound {
-    Hello { protocol: u32, uuid: Uuid, name: String },
+    /// `key` is the client's public key for end-to-end encryption.
+    Hello {
+        protocol: u32,
+        uuid: Uuid,
+        name: String,
+        key: Vec<u8>,
+    },
     Authenticate,
-    SendRequest { name: String },
-    AcceptRequest { uuid: Uuid },
-    DeclineRequest { uuid: Uuid },
-    CancelRequest { uuid: Uuid },
-    RemoveFriend { uuid: Uuid },
+    SendRequest {
+        name: String,
+    },
+    AcceptRequest {
+        uuid: Uuid,
+    },
+    DeclineRequest {
+        uuid: Uuid,
+    },
+    CancelRequest {
+        uuid: Uuid,
+    },
+    RemoveFriend {
+        uuid: Uuid,
+    },
     Ping,
+    SendMessage {
+        to: Uuid,
+        nonce: Nonce,
+        ciphertext: Vec<u8>,
+    },
+    /// Asks for up to `limit` messages older than `before` (milliseconds since the epoch, 0 for the newest).
+    RequestHistory {
+        with: Uuid,
+        before: u64,
+        limit: u8,
+    },
+    MarkRead {
+        with: Uuid,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +108,29 @@ pub enum Clientbound {
         code: ErrorCode,
     },
     Pong,
+    Message {
+        partner: Uuid,
+        entry: ChatEntry,
+    },
+    /// Messages ordered from oldest to newest.
+    History {
+        partner: Uuid,
+        has_more: bool,
+        entries: Vec<ChatEntry>,
+    },
+    FriendKey {
+        uuid: Uuid,
+        key: Vec<u8>,
+    },
+}
+
+/// A stored chat message as seen by one of its two participants.
+#[derive(Debug, Clone)]
+pub struct ChatEntry {
+    pub outgoing: bool,
+    pub time: u64,
+    pub nonce: Nonce,
+    pub ciphertext: Box<[u8]>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +143,9 @@ pub struct Profile {
 pub struct Friend {
     pub profile: Profile,
     pub online: bool,
+    /// Empty if the friend has not logged in since keys were introduced.
+    pub key: Vec<u8>,
+    pub unread: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +169,7 @@ pub enum ErrorCode {
     FriendLimit = 4,
     RequestLimit = 5,
     TargetLimit = 6,
+    NotFriends = 7,
 }
 
 #[derive(Debug)]
@@ -165,7 +232,12 @@ pub fn encode_frame(message: &Clientbound) -> Vec<u8> {
 impl Serverbound {
     fn decode(r: &mut Reader) -> Result<Self, ReadError> {
         let message = match r.u8()? {
-            0 => Serverbound::Hello { protocol: r.var_int()?, uuid: r.uuid()?, name: r.string(MAX_NAME_LENGTH)? },
+            0 => Serverbound::Hello {
+                protocol: r.var_int()?,
+                uuid: r.uuid()?,
+                name: r.string(MAX_NAME_LENGTH)?,
+                key: r.bytes(MAX_KEY_LENGTH)?.to_vec(),
+            },
             1 => Serverbound::Authenticate,
             2 => Serverbound::SendRequest { name: r.string(MAX_NAME_LENGTH)? },
             3 => Serverbound::AcceptRequest { uuid: r.uuid()? },
@@ -173,6 +245,17 @@ impl Serverbound {
             5 => Serverbound::CancelRequest { uuid: r.uuid()? },
             6 => Serverbound::RemoveFriend { uuid: r.uuid()? },
             7 => Serverbound::Ping,
+            8 => {
+                let to = r.uuid()?;
+                let nonce = r.nonce()?;
+                let ciphertext = r.bytes(MAX_CIPHERTEXT_LENGTH)?.to_vec();
+                if ciphertext.is_empty() {
+                    return Err(ReadError::Malformed("empty message"));
+                }
+                Serverbound::SendMessage { to, nonce, ciphertext }
+            }
+            9 => Serverbound::RequestHistory { with: r.uuid()?, before: r.u64()?, limit: r.u8()? },
+            10 => Serverbound::MarkRead { with: r.uuid()? },
             _ => return Err(ReadError::Malformed("packet id")),
         };
         if !r.data.is_empty() {
@@ -227,6 +310,25 @@ impl Clientbound {
             }
             Clientbound::Error { code } => out.extend([9, *code as u8]),
             Clientbound::Pong => out.push(10),
+            Clientbound::Message { partner, entry } => {
+                out.push(11);
+                write_uuid(out, *partner);
+                write_entry(out, entry);
+            }
+            Clientbound::History { partner, has_more, entries } => {
+                out.push(12);
+                write_uuid(out, *partner);
+                out.push(*has_more as u8);
+                write_var_int(out, entries.len() as u32);
+                for entry in entries {
+                    write_entry(out, entry);
+                }
+            }
+            Clientbound::FriendKey { uuid, key } => {
+                out.push(13);
+                write_uuid(out, *uuid);
+                write_bytes(out, key);
+            }
         }
     }
 }
@@ -265,6 +367,34 @@ impl Reader<'_> {
         Ok(u128::from_be_bytes(self.take(16)?.try_into().unwrap()))
     }
 
+    pub fn u64(&mut self) -> Result<u64, ReadError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    pub fn var_long(&mut self) -> Result<u64, ReadError> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = self.u8()?;
+            value |= ((byte & 0x7F) as u64) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(ReadError::Malformed("var long"))
+    }
+
+    pub fn nonce(&mut self) -> Result<Nonce, ReadError> {
+        Ok(self.take(NONCE_LENGTH)?.try_into().unwrap())
+    }
+
+    pub fn bytes(&mut self, max: usize) -> Result<&[u8], ReadError> {
+        let len = self.var_int()? as usize;
+        if len > max {
+            return Err(ReadError::Malformed("byte array too long"));
+        }
+        self.take(len)
+    }
+
     pub fn string(&mut self, max_chars: usize) -> Result<String, ReadError> {
         let len = self.var_int()? as usize;
         // UTF-8 needs at most four bytes per char, same limit as FriendlyByteBuf.
@@ -285,6 +415,19 @@ pub fn write_var_int(out: &mut Vec<u8>, mut value: u32) {
         value >>= 7;
     }
     out.push(value as u8);
+}
+
+pub fn write_var_long(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+pub fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_var_int(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
 }
 
 pub fn write_uuid(out: &mut Vec<u8>, uuid: Uuid) {
@@ -311,6 +454,15 @@ fn write_profiles(out: &mut Vec<u8>, profiles: &[Profile]) {
 fn write_friend(out: &mut Vec<u8>, friend: &Friend) {
     write_profile(out, &friend.profile);
     out.push(friend.online as u8);
+    write_bytes(out, &friend.key);
+    write_var_int(out, friend.unread);
+}
+
+fn write_entry(out: &mut Vec<u8>, entry: &ChatEntry) {
+    out.push(entry.outgoing as u8);
+    out.extend_from_slice(&entry.time.to_be_bytes());
+    out.extend_from_slice(&entry.nonce);
+    write_bytes(out, &entry.ciphertext);
 }
 
 pub fn is_valid_name(name: &str) -> bool {

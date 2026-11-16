@@ -1,4 +1,4 @@
-//! One client connection: handshake, login and the friend actions that follow.
+//! One client connection: handshake, login and the friend and chat actions that follow.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,8 @@ use tokio::time::{Instant, timeout};
 
 use crate::auth;
 use crate::protocol::{
-    self, Clientbound, DisconnectReason, ErrorCode, Friend, PROTOCOL_VERSION, Profile, Serverbound, Uuid,
+    self, Clientbound, DisconnectReason, ErrorCode, Friend, MAX_HISTORY_PAGE, PROTOCOL_VERSION, Profile, Serverbound,
+    Uuid,
 };
 use crate::store::{RequestOutcome, Store};
 
@@ -63,15 +64,15 @@ impl Inner {
         }
     }
 
-    fn friend_entry(&self, uuid: Uuid) -> Friend {
-        Friend { profile: self.store.profile(uuid), online: self.sessions.contains_key(&uuid) }
+    fn friend_entry(&self, me: Uuid, friend: Uuid) -> Friend {
+        self.store.friend_entry(me, friend, self.sessions.contains_key(&friend))
     }
 
     /// Tells both players about a new friendship and that the request between them is gone.
     fn announce_friendship(&self, a: Uuid, b: Uuid) {
         for (me, other) in [(a, b), (b, a)] {
             self.send_to(me, Clientbound::RequestRemoved { uuid: other });
-            self.send_to(me, Clientbound::FriendAdded { friend: self.friend_entry(other) });
+            self.send_to(me, Clientbound::FriendAdded { friend: self.friend_entry(me, other) });
         }
     }
 }
@@ -100,10 +101,10 @@ pub async fn run(stream: TcpStream, hub: Arc<Hub>) {
     let mut reader = BufReader::new(read_half);
     let mut buf = Vec::new();
     match login(&mut reader, &mut buf, &outbox, &hub).await {
-        Ok(profile) => {
+        Ok((profile, key)) => {
             let session_id = hub.next_session_id.fetch_add(1, Ordering::Relaxed);
             info!("{} logged in from {peer}", profile.name);
-            welcome(&hub, &profile, session_id, outbox.clone());
+            welcome(&hub, &profile, key, session_id, outbox.clone());
             let reason = play(&mut reader, &mut buf, &outbox, &hub, profile.uuid).await;
             logout(&hub, profile.uuid, session_id);
             info!("{} disconnected: {reason}", profile.name);
@@ -145,8 +146,8 @@ async fn login(
     buf: &mut Vec<u8>,
     outbox: &mpsc::Sender<Clientbound>,
     hub: &Hub,
-) -> Result<Profile, String> {
-    let Serverbound::Hello { protocol, uuid, name } = next_message(reader, buf, HANDSHAKE_TIMEOUT).await? else {
+) -> Result<(Profile, Vec<u8>), String> {
+    let Serverbound::Hello { protocol, uuid, name, key } = next_message(reader, buf, HANDSHAKE_TIMEOUT).await? else {
         disconnect(outbox, DisconnectReason::ProtocolError);
         return Err("expected hello".into());
     };
@@ -159,9 +160,9 @@ async fn login(
         disconnect(outbox, reason);
         return Err(format!("protocol {protocol}"));
     }
-    if !protocol::is_valid_name(&name) {
+    if !protocol::is_valid_name(&name) || key.is_empty() {
         disconnect(outbox, DisconnectReason::ProtocolError);
-        return Err(format!("invalid name {name:?}"));
+        return Err(format!("invalid hello from {name:?}"));
     }
 
     let server_id = auth::new_server_id();
@@ -172,14 +173,14 @@ async fn login(
     }
 
     if hub.offline_mode {
-        return Ok(Profile { uuid, name });
+        return Ok((Profile { uuid, name }, key));
     }
     let lookup_name = name.clone();
     let verified = tokio::task::spawn_blocking(move || auth::has_joined(&lookup_name, &server_id))
         .await
         .map_err(|e| e.to_string())?;
     match verified {
-        Ok(Some(profile)) => Ok(profile),
+        Ok(Some(profile)) => Ok((profile, key)),
         Ok(None) => {
             disconnect(outbox, DisconnectReason::AuthenticationFailed);
             Err(format!("{name} is not authenticated"))
@@ -192,10 +193,15 @@ async fn login(
     }
 }
 
-fn welcome(hub: &Hub, profile: &Profile, session_id: u64, outbox: mpsc::Sender<Clientbound>) {
+fn welcome(hub: &Hub, profile: &Profile, key: Vec<u8>, session_id: u64, outbox: mpsc::Sender<Clientbound>) {
     let mut guard = hub.lock();
     let inner = &mut *guard;
     inner.store.register(profile.uuid, &profile.name);
+    if inner.store.set_key(profile.uuid, key.clone()) {
+        for friend in inner.store.friends(profile.uuid) {
+            inner.send_to(friend, Clientbound::FriendKey { uuid: profile.uuid, key: key.clone() });
+        }
+    }
     let handle = SessionHandle { id: session_id, outbox };
     let was_online = match inner.sessions.insert(profile.uuid, handle) {
         Some(previous) => {
@@ -297,6 +303,26 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
                 inner.send_to(uuid, Clientbound::FriendRemoved { uuid: me });
             }
         }
+        Serverbound::SendMessage { to, nonce, ciphertext } => {
+            match inner.store.add_message(me, to, nonce, ciphertext) {
+                Ok(entry) => {
+                    let incoming = protocol::ChatEntry { outgoing: false, ..entry.clone() };
+                    inner.send_to(me, Clientbound::Message { partner: to, entry });
+                    inner.send_to(to, Clientbound::Message { partner: me, entry: incoming });
+                }
+                Err(code) => error(&inner, code),
+            }
+        }
+        Serverbound::RequestHistory { with, before, limit } => {
+            if !inner.store.are_friends(me, with) {
+                error(&inner, ErrorCode::NotFriends);
+                return Ok(());
+            }
+            let limit = (limit as usize).clamp(1, MAX_HISTORY_PAGE);
+            let (entries, has_more) = inner.store.history(me, with, before, limit);
+            inner.send_to(me, Clientbound::History { partner: with, has_more, entries });
+        }
+        Serverbound::MarkRead { with } => inner.store.mark_read(me, with),
     }
     Ok(())
 }
