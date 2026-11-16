@@ -1,5 +1,9 @@
 /target/
 
+# Server data
+*.dat
+*.dat.tmp
+
 # IDEs
 .idea/
 .vscode/
