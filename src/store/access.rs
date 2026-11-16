@@ -17,6 +17,16 @@ impl Store {
         }
     }
 
+    pub fn disallow_guest(&mut self, host: Uuid, world: WorldId, guest: Uuid) {
+        let Some(guests) = self.world_access.get_mut(&(host, world)) else {
+            return;
+        };
+        self.dirty |= guests.remove(&guest);
+        if guests.is_empty() {
+            self.world_access.remove(&(host, world));
+        }
+    }
+
     /// Forgets every invite between these two players, in both directions.
     pub(super) fn forget_access(&mut self, a: Uuid, b: Uuid) {
         let mut changed = false;

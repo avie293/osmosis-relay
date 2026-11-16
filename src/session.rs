@@ -98,6 +98,13 @@ impl Inner {
         }
     }
 
+    fn world_members(&self, host: Uuid, world: WorldId) -> Clientbound {
+        let mut members: Vec<Profile> =
+            self.store.allowed_guests(host, world).into_iter().map(|uuid| self.store.profile(uuid)).collect();
+        members.sort_by_key(|p| p.name.to_ascii_lowercase());
+        Clientbound::WorldMembers { world, members }
+    }
+
     fn stop_hosting(&mut self, host: Uuid) {
         if let Some(hosting) = self.hosting.remove(&host) {
             self.announce_hosting(host, hosting.id, "", &hosting.invited);
@@ -474,6 +481,38 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
             inner.store.allow_guest(me, id, uuid);
             let host = inner.store.profile(me);
             inner.send_to(uuid, Clientbound::Hosting { host, id, world, invited: true });
+        }
+        Serverbound::RequestWorldMembers { world } => {
+            let message = inner.world_members(me, world);
+            inner.send_to(me, message);
+        }
+        Serverbound::AddWorldMember { world, uuid } => {
+            if !inner.store.contacts(me).contains(&uuid) {
+                error(&inner, ErrorCode::NotFriends);
+                return Ok(());
+            }
+            inner.store.allow_guest(me, world, uuid);
+            // When that world is open right now, the new member may join straight away.
+            if let Some(hosting) = inner.hosting.get_mut(&me).filter(|h| h.id == world) {
+                hosting.invited.insert(uuid);
+                let name = hosting.world.clone();
+                let host = inner.store.profile(me);
+                inner.send_to(uuid, Clientbound::Hosting { host, id: world, world: name, invited: true });
+            }
+            let message = inner.world_members(me, world);
+            inner.send_to(me, message);
+        }
+        Serverbound::RemoveWorldMember { world, uuid } => {
+            inner.store.disallow_guest(me, world, uuid);
+            if let Some(hosting) = inner.hosting.get_mut(&me).filter(|h| h.id == world)
+                && hosting.invited.remove(&uuid)
+            {
+                let name = hosting.world.clone();
+                let host = inner.store.profile(me);
+                inner.send_to(uuid, Clientbound::Hosting { host, id: world, world: name, invited: false });
+            }
+            let message = inner.world_members(me, world);
+            inner.send_to(me, message);
         }
         Serverbound::JoinWorld { host } => {
             if !inner.hosting.get(&host).is_some_and(|h| h.invited.contains(&me)) {

@@ -11,7 +11,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bumped whenever a change would break older clients.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Upper bound for frames sent by clients. The largest one is a group message, encrypted once per member.
 pub const MAX_CLIENT_FRAME: usize = 16 * 1024;
@@ -132,6 +132,19 @@ pub enum Serverbound {
     JoinWorld {
         host: Uuid,
     },
+    /// Asks for everyone the player invited to one of their worlds.
+    RequestWorldMembers {
+        world: WorldId,
+    },
+    /// Invites a player to one of the player's worlds, whether or not it is hosted right now.
+    AddWorldMember {
+        world: WorldId,
+        uuid: Uuid,
+    },
+    RemoveWorldMember {
+        world: WorldId,
+        uuid: Uuid,
+    },
 }
 
 #[derive(Debug)]
@@ -244,6 +257,10 @@ pub enum Clientbound {
     /// Sent after the welcome with all stored announcements, and later with each new one.
     Announcements {
         entries: Vec<Announcement>,
+    },
+    WorldMembers {
+        world: WorldId,
+        members: Vec<Profile>,
     },
 }
 
@@ -462,6 +479,9 @@ impl Serverbound {
             24 => Serverbound::StopHosting,
             25 => Serverbound::Invite { uuid: r.uuid()? },
             26 => Serverbound::JoinWorld { host: r.uuid()? },
+            27 => Serverbound::RequestWorldMembers { world: r.uuid()? },
+            28 => Serverbound::AddWorldMember { world: r.uuid()?, uuid: r.uuid()? },
+            29 => Serverbound::RemoveWorldMember { world: r.uuid()?, uuid: r.uuid()? },
             _ => return Err(ReadError::Malformed("packet id")),
         };
         if !r.data.is_empty() {
@@ -519,6 +539,11 @@ impl Clientbound {
                 write_uuid(out, *uuid);
                 out.push(*online as u8);
                 out.extend_from_slice(&last_seen.to_be_bytes());
+            }
+            Clientbound::WorldMembers { world, members } => {
+                out.push(24);
+                write_uuid(out, *world);
+                write_profiles(out, members);
             }
             Clientbound::Announcements { entries } => {
                 out.push(23);
