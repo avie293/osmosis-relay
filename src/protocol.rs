@@ -11,7 +11,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bumped whenever a change would break older clients.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Upper bound for frames sent by clients. The largest one is a group message, encrypted once per member.
 pub const MAX_CLIENT_FRAME: usize = 16 * 1024;
@@ -30,6 +30,9 @@ pub type Nonce = [u8; NONCE_LENGTH];
 pub type Uuid = u128;
 
 pub type GroupId = u64;
+
+/// Random id the host's client stores in the world folder, so invites survive renames.
+pub type WorldId = u128;
 
 #[derive(Debug)]
 pub enum Serverbound {
@@ -118,6 +121,7 @@ pub enum Serverbound {
     },
     /// The player opened their singleplayer world for friends.
     StartHosting {
+        id: WorldId,
         world: String,
     },
     StopHosting,
@@ -219,6 +223,7 @@ pub enum Clientbound {
     /// A friend started or, with an empty world name, stopped hosting.
     Hosting {
         host: Profile,
+        id: WorldId,
         world: String,
         invited: bool,
     },
@@ -436,7 +441,7 @@ impl Serverbound {
             20 => Serverbound::RequestGroupHistory { group: r.u64()?, before: r.u64()?, limit: r.u8()? },
             21 => Serverbound::MarkGroupRead { group: r.u64()? },
             22 => Serverbound::DeleteGroupChat { group: r.u64()? },
-            23 => Serverbound::StartHosting { world: r.string(MAX_WORLD_NAME_LENGTH)? },
+            23 => Serverbound::StartHosting { id: r.uuid()?, world: r.string(MAX_WORLD_NAME_LENGTH)? },
             24 => Serverbound::StopHosting,
             25 => Serverbound::Invite { uuid: r.uuid()? },
             26 => Serverbound::JoinWorld { host: r.uuid()? },
@@ -539,9 +544,10 @@ impl Clientbound {
                 out.extend_from_slice(&group.to_be_bytes());
                 write_group_entry(out, entry);
             }
-            Clientbound::Hosting { host, world, invited } => {
+            Clientbound::Hosting { host, id, world, invited } => {
                 out.push(20);
                 write_profile(out, host);
+                write_uuid(out, *id);
                 write_string(out, world);
                 out.push(*invited as u8);
             }

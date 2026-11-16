@@ -15,7 +15,7 @@ use tokio::time::{Instant, timeout};
 use crate::auth;
 use crate::protocol::{
     self, Clientbound, DisconnectReason, ErrorCode, Friend, GroupId, MAX_HISTORY_PAGE, PROTOCOL_VERSION, Profile,
-    Serverbound, Uuid,
+    Serverbound, Uuid, WorldId,
 };
 use crate::store::{LeaveOutcome, RequestOutcome, Store};
 use crate::tunnel::Tunnels;
@@ -43,6 +43,7 @@ pub struct Inner {
 }
 
 struct Hosting {
+    id: WorldId,
     world: String,
     invited: HashSet<Uuid>,
 }
@@ -79,18 +80,18 @@ impl Inner {
     }
 
     /// Tells the host's friends, and anyone already invited, that the host started or stopped hosting.
-    fn announce_hosting(&self, host: Uuid, world: &str, invited: &HashSet<Uuid>) {
+    fn announce_hosting(&self, host: Uuid, id: WorldId, world: &str, invited: &HashSet<Uuid>) {
         let profile = self.store.profile(host);
         for friend in self.store.friends(host).chain(invited.iter().copied()).collect::<HashSet<_>>() {
             let invited = invited.contains(&friend);
-            let message = Clientbound::Hosting { host: profile.clone(), world: world.to_owned(), invited };
+            let message = Clientbound::Hosting { host: profile.clone(), id, world: world.to_owned(), invited };
             self.send_to(friend, message);
         }
     }
 
     fn stop_hosting(&mut self, host: Uuid) {
         if let Some(hosting) = self.hosting.remove(&host) {
-            self.announce_hosting(host, "", &hosting.invited);
+            self.announce_hosting(host, hosting.id, "", &hosting.invited);
         }
     }
 
@@ -253,8 +254,12 @@ fn welcome(hub: &Hub, profile: &Profile, key: Vec<u8>, session_id: u64, outbox: 
     for (&host, hosting) in &inner.hosting {
         let invited = hosting.invited.contains(&profile.uuid);
         if invited || inner.store.are_friends(profile.uuid, host) {
-            let message =
-                Clientbound::Hosting { host: inner.store.profile(host), world: hosting.world.clone(), invited };
+            let message = Clientbound::Hosting {
+                host: inner.store.profile(host),
+                id: hosting.id,
+                world: hosting.world.clone(),
+                invited,
+            };
             inner.send_to(profile.uuid, message);
         }
     }
@@ -435,9 +440,11 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
         }
         Serverbound::MarkGroupRead { group } => inner.store.mark_group_read(me, group),
         Serverbound::DeleteGroupChat { group } => inner.store.delete_group_chat(me, group),
-        Serverbound::StartHosting { world } => {
-            let hosting = Hosting { world, invited: HashSet::new() };
-            inner.announce_hosting(me, &hosting.world, &hosting.invited);
+        Serverbound::StartHosting { id, world } => {
+            // Everyone invited to this world before may come back without a new invite.
+            let invited = inner.store.allowed_guests(me, id);
+            let hosting = Hosting { id, world, invited };
+            inner.announce_hosting(me, id, &hosting.world, &hosting.invited);
             inner.hosting.insert(me, hosting);
         }
         Serverbound::StopHosting => inner.stop_hosting(me),
@@ -451,9 +458,10 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
                 return Ok(());
             };
             hosting.invited.insert(uuid);
-            let world = hosting.world.clone();
+            let (id, world) = (hosting.id, hosting.world.clone());
+            inner.store.allow_guest(me, id, uuid);
             let host = inner.store.profile(me);
-            inner.send_to(uuid, Clientbound::Hosting { host, world, invited: true });
+            inner.send_to(uuid, Clientbound::Hosting { host, id, world, invited: true });
         }
         Serverbound::JoinWorld { host } => {
             if !inner.hosting.get(&host).is_some_and(|h| h.invited.contains(&me)) {

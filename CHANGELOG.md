@@ -13,3 +13,4 @@
 - Added group chats of up to 10 members, managed by the group owner
 - Added world hosting: friends see who is hosting, hosts invite friends or group members, and invited players join
   through a tunnel port that relays the connection
+- Added remembering invites per world, so invited players can join again whenever the host opens that world

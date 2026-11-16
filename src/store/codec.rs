@@ -4,14 +4,14 @@
 //! everything else refers to users by their index in that list, and message times are stored as the difference to
 //! the previous message, which keeps the file small. Older format versions are still read.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::groups::{Group, GroupMessage};
 use super::{Conversation, Store, StoredMessage, User};
 use crate::protocol::{self, ReadError, Reader, Uuid};
 
 const MAGIC: &[u8; 4] = b"OSMO";
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 
 pub(super) fn encode(store: &Store) -> Vec<u8> {
     let order: Vec<Uuid> = store.users.keys().copied().collect();
@@ -88,6 +88,15 @@ pub(super) fn encode(store: &Store) -> Vec<u8> {
                 out.extend_from_slice(nonce);
                 protocol::write_bytes(&mut out, ciphertext);
             }
+        }
+    }
+    protocol::write_var_int(&mut out, store.world_access.len() as u32);
+    for ((host, world), guests) in &store.world_access {
+        write_index(&mut out, host);
+        protocol::write_uuid(&mut out, *world);
+        protocol::write_var_int(&mut out, guests.len() as u32);
+        for guest in guests {
+            write_index(&mut out, guest);
         }
     }
     out
@@ -203,6 +212,18 @@ pub(super) fn decode(data: &[u8]) -> Result<Store, ReadError> {
             group.messages.push_back(GroupMessage { from, time, copies });
         }
         store.groups.insert(id, group);
+    }
+    if version < 4 {
+        return Ok(store);
+    }
+
+    for _ in 0..r.var_int()? {
+        let key = (user_at(&mut r)?, r.uuid()?);
+        let mut guests = HashSet::new();
+        for _ in 0..r.var_int()? {
+            guests.insert(user_at(&mut r)?);
+        }
+        store.world_access.insert(key, guests);
     }
     Ok(store)
 }

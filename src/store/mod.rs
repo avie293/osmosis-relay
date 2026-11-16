@@ -2,6 +2,7 @@
 //!
 //! Everything lives in memory and is written to one compact binary file, see [`codec`].
 
+mod access;
 mod codec;
 mod groups;
 
@@ -9,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::{ChatEntry, ErrorCode, Friend, GroupId, Nonce, Profile, Uuid};
+use crate::protocol::{ChatEntry, ErrorCode, Friend, GroupId, Nonce, Profile, Uuid, WorldId};
 
 pub use groups::LeaveOutcome;
 
@@ -100,6 +101,8 @@ pub struct Store {
     conversations: HashMap<(Uuid, Uuid), Conversation>,
     groups: HashMap<GroupId, groups::Group>,
     next_group_id: GroupId,
+    /// Players a host invited, per world of that host.
+    world_access: HashMap<(Uuid, WorldId), HashSet<Uuid>>,
     dirty: bool,
 }
 
@@ -280,6 +283,7 @@ impl Store {
             user.friends.remove(&me);
         }
         self.conversations.remove(&conversation_key(me, other));
+        self.forget_access(me, other);
         self.dirty |= existed;
         existed
     }
