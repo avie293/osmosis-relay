@@ -1,6 +1,6 @@
-//! One client connection: handshake, login and the friend, group and chat actions that follow.
+//! One client connection: handshake, login and the friend, group, chat and hosting actions that follow.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +18,7 @@ use crate::protocol::{
     Serverbound, Uuid,
 };
 use crate::store::{LeaveOutcome, RequestOutcome, Store};
+use crate::tunnel::Tunnels;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Clients ping every 30 seconds, so this allows for a couple of lost or late pings.
@@ -29,12 +30,21 @@ const RATE_LIMIT: u32 = 40;
 pub struct Hub {
     pub inner: Mutex<Inner>,
     pub offline_mode: bool,
+    tunnels: Arc<Tunnels>,
+    tunnel_port: u16,
     next_session_id: AtomicU64,
 }
 
 pub struct Inner {
     pub store: Store,
     pub sessions: HashMap<Uuid, SessionHandle>,
+    /// Worlds being hosted right now, by host. Only kept while the host is connected.
+    hosting: HashMap<Uuid, Hosting>,
+}
+
+struct Hosting {
+    world: String,
+    invited: HashSet<Uuid>,
 }
 
 pub struct SessionHandle {
@@ -68,6 +78,22 @@ impl Inner {
         self.store.friend_entry(me, friend, self.sessions.contains_key(&friend))
     }
 
+    /// Tells the host's friends, and anyone already invited, that the host started or stopped hosting.
+    fn announce_hosting(&self, host: Uuid, world: &str, invited: &HashSet<Uuid>) {
+        let profile = self.store.profile(host);
+        for friend in self.store.friends(host).chain(invited.iter().copied()).collect::<HashSet<_>>() {
+            let invited = invited.contains(&friend);
+            let message = Clientbound::Hosting { host: profile.clone(), world: world.to_owned(), invited };
+            self.send_to(friend, message);
+        }
+    }
+
+    fn stop_hosting(&mut self, host: Uuid) {
+        if let Some(hosting) = self.hosting.remove(&host) {
+            self.announce_hosting(host, "", &hosting.invited);
+        }
+    }
+
     /// Sends every member the group as they see it, with their own unread count.
     fn announce_group(&self, group: GroupId) {
         for &member in self.store.group_members(group) {
@@ -85,10 +111,12 @@ impl Inner {
 }
 
 impl Hub {
-    pub fn new(store: Store, offline_mode: bool) -> Hub {
+    pub fn new(store: Store, offline_mode: bool, tunnels: Arc<Tunnels>, tunnel_port: u16) -> Hub {
         Hub {
-            inner: Mutex::new(Inner { store, sessions: HashMap::new() }),
+            inner: Mutex::new(Inner { store, sessions: HashMap::new(), hosting: HashMap::new() }),
             offline_mode,
+            tunnels,
+            tunnel_port,
             next_session_id: AtomicU64::new(1),
         }
     }
@@ -222,6 +250,14 @@ fn welcome(hub: &Hub, profile: &Profile, key: Vec<u8>, session_id: u64, outbox: 
     let groups = inner.store.groups_of(profile.uuid).map(|g| inner.store.group_info(g, profile.uuid)).collect();
     let welcome = Clientbound::Welcome { profile: profile.clone(), friends, incoming, outgoing, blocked, groups };
     inner.send_to(profile.uuid, welcome);
+    for (&host, hosting) in &inner.hosting {
+        let invited = hosting.invited.contains(&profile.uuid);
+        if invited || inner.store.are_friends(profile.uuid, host) {
+            let message =
+                Clientbound::Hosting { host: inner.store.profile(host), world: hosting.world.clone(), invited };
+            inner.send_to(profile.uuid, message);
+        }
+    }
     if !was_online {
         inner.broadcast_presence(profile.uuid, true);
     }
@@ -232,6 +268,7 @@ fn logout(hub: &Hub, uuid: Uuid, session_id: u64) {
     // A newer session for the same account may already have replaced this one.
     if inner.sessions.get(&uuid).is_some_and(|s| s.id == session_id) {
         inner.sessions.remove(&uuid);
+        inner.stop_hosting(uuid);
         inner.broadcast_presence(uuid, false);
     }
 }
@@ -398,6 +435,37 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
         }
         Serverbound::MarkGroupRead { group } => inner.store.mark_group_read(me, group),
         Serverbound::DeleteGroupChat { group } => inner.store.delete_group_chat(me, group),
+        Serverbound::StartHosting { world } => {
+            let hosting = Hosting { world, invited: HashSet::new() };
+            inner.announce_hosting(me, &hosting.world, &hosting.invited);
+            inner.hosting.insert(me, hosting);
+        }
+        Serverbound::StopHosting => inner.stop_hosting(me),
+        Serverbound::Invite { uuid } => {
+            if !inner.store.contacts(me).contains(&uuid) {
+                error(&inner, ErrorCode::NotFriends);
+                return Ok(());
+            }
+            let Some(hosting) = inner.hosting.get_mut(&me) else {
+                error(&inner, ErrorCode::NotHosting);
+                return Ok(());
+            };
+            hosting.invited.insert(uuid);
+            let world = hosting.world.clone();
+            let host = inner.store.profile(me);
+            inner.send_to(uuid, Clientbound::Hosting { host, world, invited: true });
+        }
+        Serverbound::JoinWorld { host } => {
+            if !inner.hosting.get(&host).is_some_and(|h| h.invited.contains(&me)) {
+                error(&inner, ErrorCode::NotInvited);
+                return Ok(());
+            }
+            let ticket = hub.tunnels.issue();
+            let port = hub.tunnel_port;
+            let guest = inner.store.profile(me);
+            inner.send_to(host, Clientbound::GuestJoining { guest, ticket, port });
+            inner.send_to(me, Clientbound::JoinTicket { host, ticket, port });
+        }
     }
     Ok(())
 }

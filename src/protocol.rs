@@ -11,7 +11,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bumped whenever a change would break older clients.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Upper bound for frames sent by clients. The largest one is a group message, encrypted once per member.
 pub const MAX_CLIENT_FRAME: usize = 16 * 1024;
@@ -23,6 +23,7 @@ pub const NONCE_LENGTH: usize = 12;
 pub const MAX_HISTORY_PAGE: usize = 50;
 pub const MAX_GROUP_NAME_LENGTH: usize = 24;
 pub const MAX_GROUP_MEMBERS: usize = 10;
+pub const MAX_WORLD_NAME_LENGTH: usize = 64;
 
 pub type Nonce = [u8; NONCE_LENGTH];
 
@@ -115,6 +116,18 @@ pub enum Serverbound {
     DeleteGroupChat {
         group: GroupId,
     },
+    /// The player opened their singleplayer world for friends.
+    StartHosting {
+        world: String,
+    },
+    StopHosting,
+    /// Lets a friend or fellow group member join the world the player is hosting.
+    Invite {
+        uuid: Uuid,
+    },
+    JoinWorld {
+        host: Uuid,
+    },
 }
 
 #[derive(Debug)]
@@ -203,6 +216,24 @@ pub enum Clientbound {
         has_more: bool,
         entries: Vec<GroupEntry>,
     },
+    /// A friend started or, with an empty world name, stopped hosting.
+    Hosting {
+        host: Profile,
+        world: String,
+        invited: bool,
+    },
+    /// Tells a guest to connect to the tunnel port with this ticket.
+    JoinTicket {
+        host: Uuid,
+        ticket: u128,
+        port: u16,
+    },
+    /// Tells the host that a guest is coming through the tunnel with this ticket.
+    GuestJoining {
+        guest: Profile,
+        ticket: u128,
+        port: u16,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +311,8 @@ pub enum ErrorCode {
     NotGroupOwner = 10,
     InvalidGroupName = 11,
     PlayerBlocked = 12,
+    NotInvited = 13,
+    NotHosting = 14,
 }
 
 #[derive(Debug)]
@@ -403,6 +436,10 @@ impl Serverbound {
             20 => Serverbound::RequestGroupHistory { group: r.u64()?, before: r.u64()?, limit: r.u8()? },
             21 => Serverbound::MarkGroupRead { group: r.u64()? },
             22 => Serverbound::DeleteGroupChat { group: r.u64()? },
+            23 => Serverbound::StartHosting { world: r.string(MAX_WORLD_NAME_LENGTH)? },
+            24 => Serverbound::StopHosting,
+            25 => Serverbound::Invite { uuid: r.uuid()? },
+            26 => Serverbound::JoinWorld { host: r.uuid()? },
             _ => return Err(ReadError::Malformed("packet id")),
         };
         if !r.data.is_empty() {
@@ -501,6 +538,24 @@ impl Clientbound {
                 out.push(18);
                 out.extend_from_slice(&group.to_be_bytes());
                 write_group_entry(out, entry);
+            }
+            Clientbound::Hosting { host, world, invited } => {
+                out.push(20);
+                write_profile(out, host);
+                write_string(out, world);
+                out.push(*invited as u8);
+            }
+            Clientbound::JoinTicket { host, ticket, port } => {
+                out.push(21);
+                write_uuid(out, *host);
+                out.extend_from_slice(&ticket.to_be_bytes());
+                out.extend_from_slice(&port.to_be_bytes());
+            }
+            Clientbound::GuestJoining { guest, ticket, port } => {
+                out.push(22);
+                write_profile(out, guest);
+                out.extend_from_slice(&ticket.to_be_bytes());
+                out.extend_from_slice(&port.to_be_bytes());
             }
             Clientbound::GroupHistory { group, has_more, entries } => {
                 out.push(19);

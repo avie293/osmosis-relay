@@ -11,3 +11,5 @@
 - Added blocking players, which ends the friendship and hides the blocker from the blocked player
 - Added deleting a chat for yourself while the other side keeps it
 - Added group chats of up to 10 members, managed by the group owner
+- Added world hosting: friends see who is hosting, hosts invite friends or group members, and invited players join
+  through a tunnel port that relays the connection

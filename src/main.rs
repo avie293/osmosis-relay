@@ -2,6 +2,7 @@ mod auth;
 mod protocol;
 mod session;
 mod store;
+mod tunnel;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,25 +14,35 @@ use tokio::net::TcpListener;
 use crate::protocol::{Clientbound, DisconnectReason};
 use crate::session::Hub;
 use crate::store::Store;
+use crate::tunnel::Tunnels;
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(10);
 
 struct Options {
     bind: String,
+    tunnel_bind: String,
     data: PathBuf,
     offline: bool,
 }
 
 fn parse_options() -> Result<Options, String> {
-    let mut options = Options { bind: "127.0.0.1:25580".into(), data: PathBuf::from("osmosis.dat"), offline: false };
+    let mut options = Options {
+        bind: "127.0.0.1:25580".into(),
+        tunnel_bind: "127.0.0.1:25581".into(),
+        data: PathBuf::from("osmosis.dat"),
+        offline: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => options.bind = args.next().ok_or("--bind needs an address")?,
+            "--tunnel-bind" => options.tunnel_bind = args.next().ok_or("--tunnel-bind needs an address")?,
             "--data" => options.data = args.next().ok_or("--data needs a path")?.into(),
             "--offline" => options.offline = true,
             "--help" => {
-                println!("Usage: osmosis-server [--bind <address:port>] [--data <file>] [--offline]");
+                println!(
+                    "Usage: osmosis-server [--bind <address:port>] [--tunnel-bind <address:port>] [--data <file>]                      [--offline]"
+                );
                 std::process::exit(0);
             }
             other => return Err(format!("Unknown argument {other}, see --help")),
@@ -57,19 +68,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let listener = match TcpListener::bind(&options.bind).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            error!("Could not bind to {}: {e}", options.bind);
-            std::process::exit(1);
-        }
-    };
+    let listener = bind(&options.bind).await;
+    let tunnel_listener = bind(&options.tunnel_bind).await;
+    let tunnel_port = tunnel_listener.local_addr().map_or(0, |a| a.port());
     if options.offline {
         warn!("Offline mode: accounts are not verified, anyone can log in as anyone. Use for local testing only.");
     }
-    info!("Listening on {}", options.bind);
+    info!("Listening on {}, tunnels on {}", options.bind, options.tunnel_bind);
 
-    let hub = Arc::new(Hub::new(store, options.offline));
+    let tunnels = Arc::new(Tunnels::default());
+    tokio::spawn(tunnel::listen(tunnel_listener, tunnels.clone()));
+    let hub = Arc::new(Hub::new(store, options.offline, tunnels, tunnel_port));
     tokio::spawn(save_loop(hub.clone(), options.data.clone()));
     loop {
         tokio::select! {
@@ -93,6 +102,16 @@ async fn main() {
     save(&hub, &options.data).await;
     // Give the writers a moment to flush the disconnect messages.
     tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+async fn bind(address: &str) -> TcpListener {
+    match TcpListener::bind(address).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Could not bind to {address}: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn save_loop(hub: Arc<Hub>, path: PathBuf) {
