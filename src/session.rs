@@ -70,8 +70,17 @@ impl Inner {
     }
 
     fn broadcast_presence(&self, uuid: Uuid, online: bool) {
+        let last_seen = self.store.last_seen(uuid);
         for friend in self.store.friends(uuid) {
-            self.send_to(friend, Clientbound::Presence { uuid, online });
+            self.send_to(friend, Clientbound::Presence { uuid, online, last_seen });
+        }
+    }
+
+    /// Sends a new announcement to everyone who is online.
+    pub fn announce(&mut self, text: String) {
+        let announcement = self.store.announce(text);
+        for session in self.sessions.values() {
+            session.send(Clientbound::Announcements { entries: vec![announcement.clone()] });
         }
     }
 
@@ -251,6 +260,8 @@ fn welcome(hub: &Hub, profile: &Profile, key: Vec<u8>, session_id: u64, outbox: 
     let groups = inner.store.groups_of(profile.uuid).map(|g| inner.store.group_info(g, profile.uuid)).collect();
     let welcome = Clientbound::Welcome { profile: profile.clone(), friends, incoming, outgoing, blocked, groups };
     inner.send_to(profile.uuid, welcome);
+    let entries = inner.store.announcements().iter().cloned().collect();
+    inner.send_to(profile.uuid, Clientbound::Announcements { entries });
     for (&host, hosting) in &inner.hosting {
         let invited = hosting.invited.contains(&profile.uuid);
         if invited || inner.store.are_friends(profile.uuid, host) {
@@ -274,6 +285,7 @@ fn logout(hub: &Hub, uuid: Uuid, session_id: u64) {
     if inner.sessions.get(&uuid).is_some_and(|s| s.id == session_id) {
         inner.sessions.remove(&uuid);
         inner.stop_hosting(uuid);
+        inner.store.mark_seen(uuid);
         inner.broadcast_presence(uuid, false);
     }
 }

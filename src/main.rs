@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info, warn};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::protocol::{Clientbound, DisconnectReason};
 use crate::session::Hub;
-use crate::store::Store;
+use crate::store::{MAX_ANNOUNCEMENT_LENGTH, Store};
 use crate::tunnel::Tunnels;
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -80,6 +81,8 @@ async fn main() {
     tokio::spawn(tunnel::listen(tunnel_listener, tunnels.clone()));
     let hub = Arc::new(Hub::new(store, options.offline, tunnels, tunnel_port));
     tokio::spawn(save_loop(hub.clone(), options.data.clone()));
+    let mut console = BufReader::new(tokio::io::stdin()).lines();
+    let mut console_open = true;
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -87,6 +90,15 @@ async fn main() {
                     tokio::spawn(session::run(stream, hub.clone()));
                 }
                 Err(e) => warn!("Could not accept a connection: {e}"),
+            },
+            line = console.next_line(), if console_open => match line {
+                Ok(Some(line)) => {
+                    if !run_command(&hub, line.trim()) {
+                        break;
+                    }
+                }
+                // No console attached, for example when started in the background.
+                _ => console_open = false,
             },
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -102,6 +114,27 @@ async fn main() {
     save(&hub, &options.data).await;
     // Give the writers a moment to flush the disconnect messages.
     tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+/// Runs a console command. Returns `false` to stop the server.
+fn run_command(hub: &Hub, line: &str) -> bool {
+    let (command, argument) = line.split_once(' ').unwrap_or((line, ""));
+    match command {
+        "" => {}
+        "announce" => {
+            let text = argument.trim();
+            if text.is_empty() || text.chars().count() > MAX_ANNOUNCEMENT_LENGTH {
+                warn!("Usage: announce <text of up to {MAX_ANNOUNCEMENT_LENGTH} characters>");
+            } else {
+                hub.inner.lock().unwrap_or_else(|p| p.into_inner()).announce(text.to_owned());
+                info!("Announcement sent");
+            }
+        }
+        "stop" => return false,
+        "help" => info!("Commands: announce <text>, stop"),
+        other => warn!("Unknown command {other}, try help"),
+    }
+    true
 }
 
 async fn bind(address: &str) -> TcpListener {

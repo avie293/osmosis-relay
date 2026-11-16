@@ -58,6 +58,7 @@ impl Store {
             owner: g.owner,
             members: g.members.iter().map(|&m| GroupMember { profile: self.profile(m), key: self.key_of(m) }).collect(),
             unread: g.unread.get(&viewer).copied().unwrap_or(0),
+            last_message: self.group_history(viewer, group, 0, 1).and_then(|(mut entries, _)| entries.pop()),
         }
     }
 

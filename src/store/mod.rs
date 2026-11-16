@@ -3,6 +3,7 @@
 //! Everything lives in memory and is written to one compact binary file, see [`codec`].
 
 mod access;
+mod announcements;
 mod codec;
 mod groups;
 
@@ -10,8 +11,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::{ChatEntry, ErrorCode, Friend, GroupId, Nonce, Profile, Uuid, WorldId};
+use crate::protocol::{Announcement, ChatEntry, ErrorCode, Friend, GroupId, Nonce, Profile, Uuid, WorldId};
 
+pub use announcements::MAX_ANNOUNCEMENT_LENGTH;
 pub use groups::LeaveOutcome;
 
 const MAX_FRIENDS: usize = 300;
@@ -30,6 +32,7 @@ struct User {
     outgoing: HashSet<Uuid>,
     blocked: HashSet<Uuid>,
     groups: HashSet<GroupId>,
+    last_seen: u64,
 }
 
 /// Messages between two friends. `low` and `high` are the two UUIDs in numeric order.
@@ -103,6 +106,7 @@ pub struct Store {
     next_group_id: GroupId,
     /// Players a host invited, per world of that host.
     world_access: HashMap<(Uuid, WorldId), HashSet<Uuid>>,
+    announcements: VecDeque<Announcement>,
     dirty: bool,
 }
 
@@ -198,7 +202,25 @@ impl Store {
     }
 
     pub fn friend_entry(&self, me: Uuid, friend: Uuid, online: bool) -> Friend {
-        Friend { profile: self.profile(friend), online, key: self.key_of(friend), unread: self.unread(me, friend) }
+        Friend {
+            profile: self.profile(friend),
+            online,
+            key: self.key_of(friend),
+            unread: self.unread(me, friend),
+            last_seen: self.last_seen(friend),
+            last_message: self.history(me, friend, 0, 1).0.pop(),
+        }
+    }
+
+    pub fn last_seen(&self, uuid: Uuid) -> u64 {
+        self.users.get(&uuid).map_or(0, |u| u.last_seen)
+    }
+
+    /// Records that the player just went offline and returns the time.
+    pub fn mark_seen(&mut self, uuid: Uuid) -> u64 {
+        let now = now_millis();
+        self.user(uuid).last_seen = now;
+        now
     }
 
     /// Friends, incoming requests, outgoing requests and blocked players of a user.

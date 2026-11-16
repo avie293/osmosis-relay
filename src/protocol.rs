@@ -11,7 +11,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bumped whenever a change would break older clients.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Upper bound for frames sent by clients. The largest one is a group message, encrypted once per member.
 pub const MAX_CLIENT_FRAME: usize = 16 * 1024;
@@ -175,9 +175,11 @@ pub enum Clientbound {
     RequestRemoved {
         uuid: Uuid,
     },
+    /// `last_seen` is when the player went offline, in milliseconds since the epoch.
     Presence {
         uuid: Uuid,
         online: bool,
+        last_seen: u64,
     },
     Error {
         code: ErrorCode,
@@ -239,6 +241,16 @@ pub enum Clientbound {
         ticket: u128,
         port: u16,
     },
+    /// Sent after the welcome with all stored announcements, and later with each new one.
+    Announcements {
+        entries: Vec<Announcement>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct Announcement {
+    pub time: u64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +260,7 @@ pub struct GroupInfo {
     pub owner: Uuid,
     pub members: Vec<GroupMember>,
     pub unread: u32,
+    pub last_message: Option<GroupEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +300,10 @@ pub struct Friend {
     /// Empty if the friend has not logged in since keys were introduced.
     pub key: Vec<u8>,
     pub unread: u32,
+    /// When the friend was last online, 0 if never seen since this was recorded.
+    pub last_seen: u64,
+    /// The newest message, for the preview in the chat list.
+    pub last_message: Option<ChatEntry>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -497,10 +514,19 @@ impl Clientbound {
                 out.push(7);
                 write_uuid(out, *uuid);
             }
-            Clientbound::Presence { uuid, online } => {
+            Clientbound::Presence { uuid, online, last_seen } => {
                 out.push(8);
                 write_uuid(out, *uuid);
                 out.push(*online as u8);
+                out.extend_from_slice(&last_seen.to_be_bytes());
+            }
+            Clientbound::Announcements { entries } => {
+                out.push(23);
+                write_var_int(out, entries.len() as u32);
+                for entry in entries {
+                    out.extend_from_slice(&entry.time.to_be_bytes());
+                    write_string(out, &entry.text);
+                }
             }
             Clientbound::Error { code } => out.extend([9, *code as u8]),
             Clientbound::Pong => out.push(10),
@@ -699,6 +725,11 @@ fn write_friend(out: &mut Vec<u8>, friend: &Friend) {
     out.push(friend.online as u8);
     write_bytes(out, &friend.key);
     write_var_int(out, friend.unread);
+    out.extend_from_slice(&friend.last_seen.to_be_bytes());
+    out.push(friend.last_message.is_some() as u8);
+    if let Some(entry) = &friend.last_message {
+        write_entry(out, entry);
+    }
 }
 
 fn write_group(out: &mut Vec<u8>, group: &GroupInfo) {
@@ -711,6 +742,10 @@ fn write_group(out: &mut Vec<u8>, group: &GroupInfo) {
         write_bytes(out, &member.key);
     }
     write_var_int(out, group.unread);
+    out.push(group.last_message.is_some() as u8);
+    if let Some(entry) = &group.last_message {
+        write_group_entry(out, entry);
+    }
 }
 
 fn write_group_entry(out: &mut Vec<u8>, entry: &GroupEntry) {

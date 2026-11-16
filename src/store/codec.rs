@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::groups::{Group, GroupMessage};
 use super::{Conversation, Store, StoredMessage, User};
-use crate::protocol::{self, ReadError, Reader, Uuid};
+use crate::protocol::{self, Announcement, ReadError, Reader, Uuid};
 
 const MAGIC: &[u8; 4] = b"OSMO";
-const FORMAT_VERSION: u8 = 4;
+const FORMAT_VERSION: u8 = 5;
 
 pub(super) fn encode(store: &Store) -> Vec<u8> {
     let order: Vec<Uuid> = store.users.keys().copied().collect();
@@ -27,6 +27,7 @@ pub(super) fn encode(store: &Store) -> Vec<u8> {
         protocol::write_uuid(&mut out, *uuid);
         protocol::write_string(&mut out, &user.name);
         protocol::write_bytes(&mut out, &user.key);
+        protocol::write_var_long(&mut out, user.last_seen);
     }
 
     // Each friendship is stored once, from the side with the lower index.
@@ -99,6 +100,11 @@ pub(super) fn encode(store: &Store) -> Vec<u8> {
             write_index(&mut out, guest);
         }
     }
+    protocol::write_var_int(&mut out, store.announcements.len() as u32);
+    for announcement in &store.announcements {
+        protocol::write_var_long(&mut out, announcement.time);
+        protocol::write_string(&mut out, &announcement.text);
+    }
     out
 }
 
@@ -126,8 +132,9 @@ pub(super) fn decode(data: &[u8]) -> Result<Store, ReadError> {
         let name = r.string(protocol::MAX_NAME_LENGTH)?;
         // Version 1 predates encryption keys.
         let key = if version >= 2 { r.bytes(protocol::MAX_KEY_LENGTH)?.to_vec() } else { Vec::new() };
+        let last_seen = if version >= 5 { r.var_long()? } else { 0 };
         store.by_name.insert(name.to_ascii_lowercase(), uuid);
-        store.users.insert(uuid, User { name, key, ..Default::default() });
+        store.users.insert(uuid, User { name, key, last_seen, ..Default::default() });
         order.push(uuid);
     }
     let user_at = |r: &mut Reader| -> Result<Uuid, ReadError> {
@@ -224,6 +231,15 @@ pub(super) fn decode(data: &[u8]) -> Result<Store, ReadError> {
             guests.insert(user_at(&mut r)?);
         }
         store.world_access.insert(key, guests);
+    }
+    if version < 5 {
+        return Ok(store);
+    }
+
+    for _ in 0..r.var_int()? {
+        let time = r.var_long()?;
+        let text = r.string(super::MAX_ANNOUNCEMENT_LENGTH)?;
+        store.announcements.push_back(Announcement { time, text });
     }
     Ok(store)
 }
