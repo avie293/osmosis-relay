@@ -3,7 +3,7 @@ name = "osmosis-server"
 version = "1.0.0"
 edition = "2024"
 description = "Coordination server for the Osmosis Minecraft mod."
-license-file = "../LICENSE"
+license-file = "LICENSE"
 publish = false
 
 [dependencies]
