@@ -1,4 +1,4 @@
-//! One client connection: handshake, login and the friend and chat actions that follow.
+//! One client connection: handshake, login and the friend, group and chat actions that follow.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,10 +14,10 @@ use tokio::time::{Instant, timeout};
 
 use crate::auth;
 use crate::protocol::{
-    self, Clientbound, DisconnectReason, ErrorCode, Friend, MAX_HISTORY_PAGE, PROTOCOL_VERSION, Profile, Serverbound,
-    Uuid,
+    self, Clientbound, DisconnectReason, ErrorCode, Friend, GroupId, MAX_HISTORY_PAGE, PROTOCOL_VERSION, Profile,
+    Serverbound, Uuid,
 };
-use crate::store::{RequestOutcome, Store};
+use crate::store::{LeaveOutcome, RequestOutcome, Store};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Clients ping every 30 seconds, so this allows for a couple of lost or late pings.
@@ -66,6 +66,13 @@ impl Inner {
 
     fn friend_entry(&self, me: Uuid, friend: Uuid) -> Friend {
         self.store.friend_entry(me, friend, self.sessions.contains_key(&friend))
+    }
+
+    /// Sends every member the group as they see it, with their own unread count.
+    fn announce_group(&self, group: GroupId) {
+        for &member in self.store.group_members(group) {
+            self.send_to(member, Clientbound::GroupUpdated { group: self.store.group_info(group, member) });
+        }
     }
 
     /// Tells both players about a new friendship and that the request between them is gone.
@@ -198,8 +205,8 @@ fn welcome(hub: &Hub, profile: &Profile, key: Vec<u8>, session_id: u64, outbox: 
     let inner = &mut *guard;
     inner.store.register(profile.uuid, &profile.name);
     if inner.store.set_key(profile.uuid, key.clone()) {
-        for friend in inner.store.friends(profile.uuid) {
-            inner.send_to(friend, Clientbound::FriendKey { uuid: profile.uuid, key: key.clone() });
+        for contact in inner.store.contacts(profile.uuid) {
+            inner.send_to(contact, Clientbound::FriendKey { uuid: profile.uuid, key: key.clone() });
         }
     }
     let handle = SessionHandle { id: session_id, outbox };
@@ -210,9 +217,11 @@ fn welcome(hub: &Hub, profile: &Profile, key: Vec<u8>, session_id: u64, outbox: 
         }
         None => false,
     };
-    let (friends, incoming, outgoing) =
+    let (friends, incoming, outgoing, blocked) =
         inner.store.welcome_lists(profile.uuid, |uuid| inner.sessions.contains_key(&uuid));
-    inner.send_to(profile.uuid, Clientbound::Welcome { profile: profile.clone(), friends, incoming, outgoing });
+    let groups = inner.store.groups_of(profile.uuid).map(|g| inner.store.group_info(g, profile.uuid)).collect();
+    let welcome = Clientbound::Welcome { profile: profile.clone(), friends, incoming, outgoing, blocked, groups };
+    inner.send_to(profile.uuid, welcome);
     if !was_online {
         inner.broadcast_presence(profile.uuid, true);
     }
@@ -304,7 +313,7 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
             }
         }
         Serverbound::SendMessage { to, nonce, ciphertext } => {
-            match inner.store.add_message(me, to, nonce, ciphertext) {
+            match inner.store.add_message(me, to, nonce, ciphertext.into_boxed_slice()) {
                 Ok(entry) => {
                     let incoming = protocol::ChatEntry { outgoing: false, ..entry.clone() };
                     inner.send_to(me, Clientbound::Message { partner: to, entry });
@@ -323,6 +332,72 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
             inner.send_to(me, Clientbound::History { partner: with, has_more, entries });
         }
         Serverbound::MarkRead { with } => inner.store.mark_read(me, with),
+        Serverbound::DeleteChat { with } => inner.store.delete_chat(me, with),
+        Serverbound::Block { uuid } => match inner.store.block(me, uuid) {
+            Ok(outcome) => {
+                inner.send_to(me, Clientbound::Blocked { profile: inner.store.profile(uuid) });
+                // The blocked player only learns that the friendship or request is gone.
+                if outcome.was_friend {
+                    inner.send_to(me, Clientbound::FriendRemoved { uuid });
+                    inner.send_to(uuid, Clientbound::FriendRemoved { uuid: me });
+                }
+                if outcome.had_request {
+                    inner.send_to(me, Clientbound::RequestRemoved { uuid });
+                    inner.send_to(uuid, Clientbound::RequestRemoved { uuid: me });
+                }
+            }
+            Err(code) => error(&inner, code),
+        },
+        Serverbound::Unblock { uuid } => {
+            inner.store.unblock(me, uuid);
+            inner.send_to(me, Clientbound::Unblocked { uuid });
+        }
+        Serverbound::CreateGroup { name, members } => match inner.store.create_group(me, name, members) {
+            Ok(group) => inner.announce_group(group),
+            Err(code) => error(&inner, code),
+        },
+        Serverbound::RenameGroup { group, name } => match inner.store.rename_group(me, group, name) {
+            Ok(()) => inner.announce_group(group),
+            Err(code) => error(&inner, code),
+        },
+        Serverbound::AddGroupMember { group, uuid } => match inner.store.add_group_member(me, group, uuid) {
+            Ok(()) => inner.announce_group(group),
+            Err(code) => error(&inner, code),
+        },
+        Serverbound::RemoveGroupMember { group, uuid } => match inner.store.remove_group_member(me, group, uuid) {
+            Ok(true) => {
+                inner.send_to(uuid, Clientbound::GroupRemoved { group });
+                inner.announce_group(group);
+            }
+            Ok(false) => {}
+            Err(code) => error(&inner, code),
+        },
+        Serverbound::LeaveGroup { group } => {
+            inner.send_to(me, Clientbound::GroupRemoved { group });
+            if let Some(LeaveOutcome::Left) = inner.store.leave_group(me, group) {
+                inner.announce_group(group);
+            }
+        }
+        Serverbound::SendGroupMessage { group, copies } => match inner.store.add_group_message(me, group, copies) {
+            Ok(time) => {
+                for &member in inner.store.group_members(group) {
+                    if let Some(entry) = inner.store.group_message_for(group, time, member) {
+                        inner.send_to(member, Clientbound::GroupMessage { group, entry });
+                    }
+                }
+            }
+            Err(Some(code)) => error(&inner, code),
+            Err(None) => return Err("group message without one copy per member"),
+        },
+        Serverbound::RequestGroupHistory { group, before, limit } => {
+            let limit = (limit as usize).clamp(1, MAX_HISTORY_PAGE);
+            match inner.store.group_history(me, group, before, limit) {
+                Some((entries, has_more)) => inner.send_to(me, Clientbound::GroupHistory { group, has_more, entries }),
+                None => inner.send_to(me, Clientbound::GroupRemoved { group }),
+            }
+        }
+        Serverbound::MarkGroupRead { group } => inner.store.mark_group_read(me, group),
+        Serverbound::DeleteGroupChat { group } => inner.store.delete_group_chat(me, group),
     }
     Ok(())
 }

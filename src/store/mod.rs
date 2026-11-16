@@ -1,21 +1,22 @@
-//! Friend graph, encrypted chat history and their on-disk format.
+//! Friend graph, blocks, groups and the encrypted chat history.
 //!
-//! The data file starts with the magic `OSMO` and a format version. Users are listed once with their UUID, name and
-//! public key; friendships, requests and conversations then refer to users by their index in that list, and message
-//! times are stored as the difference to the previous message, which keeps the file small.
+//! Everything lives in memory and is written to one compact binary file, see [`codec`].
+
+mod codec;
+mod groups;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::{self, ChatEntry, ErrorCode, Friend, Nonce, Profile, ReadError, Reader, Uuid};
+use crate::protocol::{ChatEntry, ErrorCode, Friend, GroupId, Nonce, Profile, Uuid};
 
-const MAGIC: &[u8; 4] = b"OSMO";
-const FORMAT_VERSION: u8 = 2;
+pub use groups::LeaveOutcome;
 
 const MAX_FRIENDS: usize = 300;
 const MAX_OUTGOING: usize = 50;
 const MAX_INCOMING: usize = 100;
+const MAX_BLOCKED: usize = 500;
 /// Older messages are dropped once a conversation holds this many.
 const MAX_HISTORY: usize = 500;
 
@@ -26,6 +27,8 @@ struct User {
     friends: HashSet<Uuid>,
     incoming: HashSet<Uuid>,
     outgoing: HashSet<Uuid>,
+    blocked: HashSet<Uuid>,
+    groups: HashSet<GroupId>,
 }
 
 /// Messages between two friends. `low` and `high` are the two UUIDs in numeric order.
@@ -34,6 +37,9 @@ struct Conversation {
     messages: VecDeque<StoredMessage>,
     unread_low: u32,
     unread_high: u32,
+    /// Messages up to these times were deleted by that participant and are no longer shown to them.
+    cleared_low: u64,
+    cleared_high: u64,
 }
 
 struct StoredMessage {
@@ -58,10 +64,33 @@ impl Conversation {
     fn unread_mut(&mut self, for_low: bool) -> &mut u32 {
         if for_low { &mut self.unread_low } else { &mut self.unread_high }
     }
+
+    fn cleared(&self, for_low: bool) -> u64 {
+        if for_low { self.cleared_low } else { self.cleared_high }
+    }
 }
 
 fn conversation_key(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
     if a < b { (a, b) } else { (b, a) }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Returns up to `limit` items with a time below `before` and above `cleared`, plus whether older visible ones exist.
+fn page<T>(
+    items: &VecDeque<T>,
+    time: impl Fn(&T) -> u64,
+    before: u64,
+    cleared: u64,
+    limit: usize,
+) -> (usize, usize, bool) {
+    let before = if before == 0 { u64::MAX } else { before };
+    let first_visible = items.partition_point(|m| time(m) <= cleared);
+    let end = items.partition_point(|m| time(m) < before).max(first_visible);
+    let start = end.saturating_sub(limit).max(first_visible);
+    (start, end, start > first_visible)
 }
 
 #[derive(Default)]
@@ -69,6 +98,8 @@ pub struct Store {
     users: HashMap<Uuid, User>,
     by_name: HashMap<String, Uuid>,
     conversations: HashMap<(Uuid, Uuid), Conversation>,
+    groups: HashMap<GroupId, groups::Group>,
+    next_group_id: GroupId,
     dirty: bool,
 }
 
@@ -78,11 +109,17 @@ pub enum RequestOutcome {
     Accepted,
 }
 
+/// What blocking a player ended, so both sides can be told.
+pub struct BlockOutcome {
+    pub was_friend: bool,
+    pub had_request: bool,
+}
+
 impl Store {
     pub fn load(path: &Path) -> std::io::Result<Store> {
         match std::fs::read(path) {
             Ok(data) => {
-                Store::decode(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+                codec::decode(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
             Err(e) => Err(e),
@@ -95,7 +132,7 @@ impl Store {
             return None;
         }
         self.dirty = false;
-        Some(self.encode())
+        Some(codec::encode(self))
     }
 
     pub fn name_of(&self, uuid: Uuid) -> Option<&str> {
@@ -147,22 +184,32 @@ impl Store {
         self.users.get(&a).is_some_and(|u| u.friends.contains(&b))
     }
 
+    /// Everyone who needs to hear about this player's key or presence: friends and fellow group members.
+    pub fn contacts(&self, uuid: Uuid) -> HashSet<Uuid> {
+        let mut contacts: HashSet<Uuid> = self.friends(uuid).collect();
+        for group in self.groups_of(uuid) {
+            contacts.extend(self.groups[&group].members.iter().copied());
+        }
+        contacts.remove(&uuid);
+        contacts
+    }
+
     pub fn friend_entry(&self, me: Uuid, friend: Uuid, online: bool) -> Friend {
         Friend { profile: self.profile(friend), online, key: self.key_of(friend), unread: self.unread(me, friend) }
     }
 
+    /// Friends, incoming requests, outgoing requests and blocked players of a user.
     pub fn welcome_lists(
         &self,
         uuid: Uuid,
         is_online: impl Fn(Uuid) -> bool,
-    ) -> (Vec<Friend>, Vec<Profile>, Vec<Profile>) {
+    ) -> (Vec<Friend>, Vec<Profile>, Vec<Profile>, Vec<Profile>) {
         let Some(user) = self.users.get(&uuid) else {
             return Default::default();
         };
         let friends = user.friends.iter().map(|&f| self.friend_entry(uuid, f, is_online(f))).collect();
-        let incoming = user.incoming.iter().map(|&u| self.profile(u)).collect();
-        let outgoing = user.outgoing.iter().map(|&u| self.profile(u)).collect();
-        (friends, incoming, outgoing)
+        let profiles = |set: &HashSet<Uuid>| set.iter().map(|&u| self.profile(u)).collect();
+        (friends, profiles(&user.incoming), profiles(&user.outgoing), profiles(&user.blocked))
     }
 
     pub fn send_request(&mut self, from: Uuid, to: Uuid) -> Result<RequestOutcome, ErrorCode> {
@@ -170,6 +217,13 @@ impl Store {
             return Err(ErrorCode::CannotAddSelf);
         }
         let sender = &self.users[&from];
+        if sender.blocked.contains(&to) {
+            return Err(ErrorCode::PlayerBlocked);
+        }
+        // Someone who blocked the sender looks like they do not exist.
+        if self.users.get(&to).is_none_or(|t| t.blocked.contains(&from)) {
+            return Err(ErrorCode::PlayerNotFound);
+        }
         if sender.friends.contains(&to) {
             return Err(ErrorCode::AlreadyFriends);
         }
@@ -186,13 +240,12 @@ impl Store {
         if sender.outgoing.len() >= MAX_OUTGOING {
             return Err(ErrorCode::RequestLimit);
         }
-        let target = self.users.get_mut(&to).ok_or(ErrorCode::PlayerNotFound)?;
+        let target = self.users.get_mut(&to).expect("checked above");
         if target.incoming.len() >= MAX_INCOMING {
             return Err(ErrorCode::TargetLimit);
         }
         target.incoming.insert(from);
         self.user(from).outgoing.insert(to);
-        self.dirty = true;
         Ok(RequestOutcome::Sent(self.profile(to)))
     }
 
@@ -231,6 +284,26 @@ impl Store {
         existed
     }
 
+    /// Ends any friendship or request with `other` and keeps them from contacting `me` again.
+    pub fn block(&mut self, me: Uuid, other: Uuid) -> Result<BlockOutcome, ErrorCode> {
+        if me == other || !self.users.contains_key(&other) {
+            return Err(ErrorCode::PlayerNotFound);
+        }
+        if self.users[&me].blocked.len() >= MAX_BLOCKED {
+            return Err(ErrorCode::RequestLimit);
+        }
+        let was_friend = self.remove_friend(me, other);
+        let had_request = self.unlink_request(me, other) | self.unlink_request(other, me);
+        self.user(me).blocked.insert(other);
+        Ok(BlockOutcome { was_friend, had_request })
+    }
+
+    pub fn unblock(&mut self, me: Uuid, other: Uuid) -> bool {
+        let existed = self.users.get_mut(&me).is_some_and(|u| u.blocked.remove(&other));
+        self.dirty |= existed;
+        existed
+    }
+
     /// Stores a message and returns it as seen by the sender. Times are kept strictly increasing per conversation,
     /// so they also work as cursors for paging through the history.
     pub fn add_message(
@@ -238,7 +311,7 @@ impl Store {
         from: Uuid,
         to: Uuid,
         nonce: Nonce,
-        ciphertext: Vec<u8>,
+        ciphertext: Box<[u8]>,
     ) -> Result<ChatEntry, ErrorCode> {
         if !self.are_friends(from, to) {
             return Err(ErrorCode::NotFriends);
@@ -246,9 +319,8 @@ impl Store {
         let key = conversation_key(from, to);
         let from_low = key.0 == from;
         let conversation = self.conversations.entry(key).or_default();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-        let time = conversation.messages.back().map_or(now, |last| now.max(last.time + 1));
-        let message = StoredMessage { from_low, time, nonce, ciphertext: ciphertext.into_boxed_slice() };
+        let time = conversation.messages.back().map_or(now_millis(), |last| now_millis().max(last.time + 1));
+        let message = StoredMessage { from_low, time, nonce, ciphertext };
         let entry = message.view(from_low);
         conversation.messages.push_back(message);
         if conversation.messages.len() > MAX_HISTORY {
@@ -266,12 +338,11 @@ impl Store {
         let Some(conversation) = self.conversations.get(&key) else {
             return (Vec::new(), false);
         };
-        let before = if before == 0 { u64::MAX } else { before };
-        let end = conversation.messages.partition_point(|m| m.time < before);
-        let start = end.saturating_sub(limit);
         let viewer_is_low = key.0 == me;
+        let (start, end, has_more) =
+            page(&conversation.messages, |m| m.time, before, conversation.cleared(viewer_is_low), limit);
         let entries = conversation.messages.range(start..end).map(|m| m.view(viewer_is_low)).collect();
-        (entries, start > 0)
+        (entries, has_more)
     }
 
     pub fn unread(&self, me: Uuid, with: Uuid) -> u32 {
@@ -290,112 +361,24 @@ impl Store {
         }
     }
 
+    /// Hides everything sent so far from `me`; the other participant still sees it.
+    pub fn delete_chat(&mut self, me: Uuid, with: Uuid) {
+        let key = conversation_key(me, with);
+        if let Some(conversation) = self.conversations.get_mut(&key) {
+            let last = conversation.messages.back().map_or(0, |m| m.time);
+            let for_low = key.0 == me;
+            *conversation.unread_mut(for_low) = 0;
+            if for_low {
+                conversation.cleared_low = last;
+            } else {
+                conversation.cleared_high = last;
+            }
+            self.dirty = true;
+        }
+    }
+
     fn user(&mut self, uuid: Uuid) -> &mut User {
         self.dirty = true;
         self.users.get_mut(&uuid).expect("user is registered")
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        let order: Vec<Uuid> = self.users.keys().copied().collect();
-        let index: HashMap<Uuid, u32> = order.iter().enumerate().map(|(i, &u)| (u, i as u32)).collect();
-
-        let mut out = Vec::with_capacity(16 + order.len() * 64);
-        out.extend_from_slice(MAGIC);
-        out.push(FORMAT_VERSION);
-        protocol::write_var_int(&mut out, order.len() as u32);
-        for uuid in &order {
-            let user = &self.users[uuid];
-            protocol::write_uuid(&mut out, *uuid);
-            protocol::write_string(&mut out, &user.name);
-            protocol::write_bytes(&mut out, &user.key);
-        }
-
-        // Each friendship is stored once, from the side with the lower index.
-        let mut friendships = Vec::new();
-        let mut requests = Vec::new();
-        for (i, uuid) in order.iter().enumerate() {
-            let user = &self.users[uuid];
-            friendships.extend(user.friends.iter().map(|f| index[f]).filter(|&j| j > i as u32).map(|j| (i as u32, j)));
-            requests.extend(user.outgoing.iter().map(|t| (i as u32, index[t])));
-        }
-        for pairs in [friendships, requests] {
-            protocol::write_var_int(&mut out, pairs.len() as u32);
-            for (a, b) in pairs {
-                protocol::write_var_int(&mut out, a);
-                protocol::write_var_int(&mut out, b);
-            }
-        }
-
-        protocol::write_var_int(&mut out, self.conversations.len() as u32);
-        for ((low, high), conversation) in &self.conversations {
-            protocol::write_var_int(&mut out, index[low]);
-            protocol::write_var_int(&mut out, index[high]);
-            protocol::write_var_int(&mut out, conversation.unread_low);
-            protocol::write_var_int(&mut out, conversation.unread_high);
-            protocol::write_var_int(&mut out, conversation.messages.len() as u32);
-            let mut previous = 0;
-            for message in &conversation.messages {
-                out.push(message.from_low as u8);
-                protocol::write_var_long(&mut out, message.time - previous);
-                previous = message.time;
-                out.extend_from_slice(&message.nonce);
-                protocol::write_bytes(&mut out, &message.ciphertext);
-            }
-        }
-        out
-    }
-
-    fn decode(data: &[u8]) -> Result<Store, ReadError> {
-        let rest = data.strip_prefix(MAGIC).ok_or(ReadError::Malformed("not an Osmosis data file"))?;
-        let mut r = Reader { data: rest };
-        let version = r.u8()?;
-        if version != 1 && version != FORMAT_VERSION {
-            return Err(ReadError::Malformed("unsupported format version"));
-        }
-
-        let mut store = Store::default();
-        let count = r.var_int()? as usize;
-        let mut order = Vec::with_capacity(count);
-        for _ in 0..count {
-            let uuid = r.uuid()?;
-            let name = r.string(protocol::MAX_NAME_LENGTH)?;
-            // Version 1 predates encryption keys.
-            let key = if version >= 2 { r.bytes(protocol::MAX_KEY_LENGTH)?.to_vec() } else { Vec::new() };
-            store.by_name.insert(name.to_ascii_lowercase(), uuid);
-            store.users.insert(uuid, User { name, key, ..Default::default() });
-            order.push(uuid);
-        }
-        let user_at = |r: &mut Reader| -> Result<Uuid, ReadError> {
-            order.get(r.var_int()? as usize).copied().ok_or(ReadError::Malformed("user index"))
-        };
-        for _ in 0..r.var_int()? {
-            let (a, b) = (user_at(&mut r)?, user_at(&mut r)?);
-            store.users.get_mut(&a).unwrap().friends.insert(b);
-            store.users.get_mut(&b).unwrap().friends.insert(a);
-        }
-        for _ in 0..r.var_int()? {
-            let (from, to) = (user_at(&mut r)?, user_at(&mut r)?);
-            store.users.get_mut(&from).unwrap().outgoing.insert(to);
-            store.users.get_mut(&to).unwrap().incoming.insert(from);
-        }
-        if version < 2 {
-            return Ok(store);
-        }
-
-        for _ in 0..r.var_int()? {
-            let key = (user_at(&mut r)?, user_at(&mut r)?);
-            let mut conversation =
-                Conversation { unread_low: r.var_int()?, unread_high: r.var_int()?, ..Default::default() };
-            let mut time = 0;
-            for _ in 0..r.var_int()? {
-                let from_low = r.u8()? != 0;
-                time += r.var_long()?;
-                let nonce = r.nonce()?;
-                let ciphertext = r.bytes(protocol::MAX_CIPHERTEXT_LENGTH)?.into();
-                conversation.messages.push_back(StoredMessage { from_low, time, nonce, ciphertext });
-            }
-            store.conversations.insert(key, conversation);
-        }
-        Ok(store)
     }
 }

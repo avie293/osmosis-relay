@@ -11,20 +11,24 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bumped whenever a change would break older clients.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
-/// Upper bound for frames sent by clients. The largest one is a chat message.
-pub const MAX_CLIENT_FRAME: usize = 8 * 1024;
+/// Upper bound for frames sent by clients. The largest one is a group message, encrypted once per member.
+pub const MAX_CLIENT_FRAME: usize = 16 * 1024;
 
 pub const MAX_NAME_LENGTH: usize = 16;
 pub const MAX_KEY_LENGTH: usize = 64;
 pub const MAX_CIPHERTEXT_LENGTH: usize = 4096;
 pub const NONCE_LENGTH: usize = 12;
 pub const MAX_HISTORY_PAGE: usize = 50;
+pub const MAX_GROUP_NAME_LENGTH: usize = 24;
+pub const MAX_GROUP_MEMBERS: usize = 10;
 
 pub type Nonce = [u8; NONCE_LENGTH];
 
 pub type Uuid = u128;
+
+pub type GroupId = u64;
 
 #[derive(Debug)]
 pub enum Serverbound {
@@ -66,6 +70,58 @@ pub enum Serverbound {
     MarkRead {
         with: Uuid,
     },
+    Block {
+        uuid: Uuid,
+    },
+    Unblock {
+        uuid: Uuid,
+    },
+    /// Hides the conversation from the sender only; the friend keeps their copy.
+    DeleteChat {
+        with: Uuid,
+    },
+    CreateGroup {
+        name: String,
+        members: Vec<Uuid>,
+    },
+    RenameGroup {
+        group: GroupId,
+        name: String,
+    },
+    AddGroupMember {
+        group: GroupId,
+        uuid: Uuid,
+    },
+    RemoveGroupMember {
+        group: GroupId,
+        uuid: Uuid,
+    },
+    LeaveGroup {
+        group: GroupId,
+    },
+    /// The message encrypted separately for every member, including the sender.
+    SendGroupMessage {
+        group: GroupId,
+        copies: Vec<SealedCopy>,
+    },
+    RequestGroupHistory {
+        group: GroupId,
+        before: u64,
+        limit: u8,
+    },
+    MarkGroupRead {
+        group: GroupId,
+    },
+    DeleteGroupChat {
+        group: GroupId,
+    },
+}
+
+#[derive(Debug)]
+pub struct SealedCopy {
+    pub recipient: Uuid,
+    pub nonce: Nonce,
+    pub ciphertext: Box<[u8]>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +135,8 @@ pub enum Clientbound {
         friends: Vec<Friend>,
         incoming: Vec<Profile>,
         outgoing: Vec<Profile>,
+        blocked: Vec<Profile>,
+        groups: Vec<GroupInfo>,
     },
     /// Sent right before the server closes the connection.
     Disconnect {
@@ -122,6 +180,53 @@ pub enum Clientbound {
         uuid: Uuid,
         key: Vec<u8>,
     },
+    Blocked {
+        profile: Profile,
+    },
+    Unblocked {
+        uuid: Uuid,
+    },
+    /// Sent to every member whenever a group is created or changes.
+    GroupUpdated {
+        group: GroupInfo,
+    },
+    /// The player left, was removed or the group no longer exists.
+    GroupRemoved {
+        group: GroupId,
+    },
+    GroupMessage {
+        group: GroupId,
+        entry: GroupEntry,
+    },
+    GroupHistory {
+        group: GroupId,
+        has_more: bool,
+        entries: Vec<GroupEntry>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupInfo {
+    pub id: GroupId,
+    pub name: String,
+    pub owner: Uuid,
+    pub members: Vec<GroupMember>,
+    pub unread: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupMember {
+    pub profile: Profile,
+    pub key: Vec<u8>,
+}
+
+/// A group message as seen by one member: only the copy that was encrypted for them.
+#[derive(Debug, Clone)]
+pub struct GroupEntry {
+    pub from: Uuid,
+    pub time: u64,
+    pub nonce: Nonce,
+    pub ciphertext: Box<[u8]>,
 }
 
 /// A stored chat message as seen by one of its two participants.
@@ -170,6 +275,11 @@ pub enum ErrorCode {
     RequestLimit = 5,
     TargetLimit = 6,
     NotFriends = 7,
+    GroupLimit = 8,
+    GroupFull = 9,
+    NotGroupOwner = 10,
+    InvalidGroupName = 11,
+    PlayerBlocked = 12,
 }
 
 #[derive(Debug)]
@@ -256,6 +366,43 @@ impl Serverbound {
             }
             9 => Serverbound::RequestHistory { with: r.uuid()?, before: r.u64()?, limit: r.u8()? },
             10 => Serverbound::MarkRead { with: r.uuid()? },
+            11 => Serverbound::Block { uuid: r.uuid()? },
+            12 => Serverbound::Unblock { uuid: r.uuid()? },
+            13 => Serverbound::DeleteChat { with: r.uuid()? },
+            14 => {
+                let name = r.string(MAX_GROUP_NAME_LENGTH)?;
+                let count = r.var_int()? as usize;
+                if count > MAX_GROUP_MEMBERS {
+                    return Err(ReadError::Malformed("too many group members"));
+                }
+                let members = (0..count).map(|_| r.uuid()).collect::<Result<_, _>>()?;
+                Serverbound::CreateGroup { name, members }
+            }
+            15 => Serverbound::RenameGroup { group: r.u64()?, name: r.string(MAX_GROUP_NAME_LENGTH)? },
+            16 => Serverbound::AddGroupMember { group: r.u64()?, uuid: r.uuid()? },
+            17 => Serverbound::RemoveGroupMember { group: r.u64()?, uuid: r.uuid()? },
+            18 => Serverbound::LeaveGroup { group: r.u64()? },
+            19 => {
+                let group = r.u64()?;
+                let count = r.var_int()? as usize;
+                if count == 0 || count > MAX_GROUP_MEMBERS {
+                    return Err(ReadError::Malformed("group message copies"));
+                }
+                let mut copies = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let recipient = r.uuid()?;
+                    let nonce = r.nonce()?;
+                    let ciphertext = r.bytes(MAX_CIPHERTEXT_LENGTH)?;
+                    if ciphertext.is_empty() {
+                        return Err(ReadError::Malformed("empty message"));
+                    }
+                    copies.push(SealedCopy { recipient, nonce, ciphertext: ciphertext.into() });
+                }
+                Serverbound::SendGroupMessage { group, copies }
+            }
+            20 => Serverbound::RequestGroupHistory { group: r.u64()?, before: r.u64()?, limit: r.u8()? },
+            21 => Serverbound::MarkGroupRead { group: r.u64()? },
+            22 => Serverbound::DeleteGroupChat { group: r.u64()? },
             _ => return Err(ReadError::Malformed("packet id")),
         };
         if !r.data.is_empty() {
@@ -272,7 +419,7 @@ impl Clientbound {
                 out.push(0);
                 write_string(out, server_id);
             }
-            Clientbound::Welcome { profile, friends, incoming, outgoing } => {
+            Clientbound::Welcome { profile, friends, incoming, outgoing, blocked, groups } => {
                 out.push(1);
                 write_profile(out, profile);
                 write_var_int(out, friends.len() as u32);
@@ -281,6 +428,11 @@ impl Clientbound {
                 }
                 write_profiles(out, incoming);
                 write_profiles(out, outgoing);
+                write_profiles(out, blocked);
+                write_var_int(out, groups.len() as u32);
+                for group in groups {
+                    write_group(out, group);
+                }
             }
             Clientbound::Disconnect { reason } => out.extend([2, *reason as u8]),
             Clientbound::FriendAdded { friend } => {
@@ -328,6 +480,36 @@ impl Clientbound {
                 out.push(13);
                 write_uuid(out, *uuid);
                 write_bytes(out, key);
+            }
+            Clientbound::Blocked { profile } => {
+                out.push(14);
+                write_profile(out, profile);
+            }
+            Clientbound::Unblocked { uuid } => {
+                out.push(15);
+                write_uuid(out, *uuid);
+            }
+            Clientbound::GroupUpdated { group } => {
+                out.push(16);
+                write_group(out, group);
+            }
+            Clientbound::GroupRemoved { group } => {
+                out.push(17);
+                out.extend_from_slice(&group.to_be_bytes());
+            }
+            Clientbound::GroupMessage { group, entry } => {
+                out.push(18);
+                out.extend_from_slice(&group.to_be_bytes());
+                write_group_entry(out, entry);
+            }
+            Clientbound::GroupHistory { group, has_more, entries } => {
+                out.push(19);
+                out.extend_from_slice(&group.to_be_bytes());
+                out.push(*has_more as u8);
+                write_var_int(out, entries.len() as u32);
+                for entry in entries {
+                    write_group_entry(out, entry);
+                }
             }
         }
     }
@@ -458,11 +640,35 @@ fn write_friend(out: &mut Vec<u8>, friend: &Friend) {
     write_var_int(out, friend.unread);
 }
 
+fn write_group(out: &mut Vec<u8>, group: &GroupInfo) {
+    out.extend_from_slice(&group.id.to_be_bytes());
+    write_string(out, &group.name);
+    write_uuid(out, group.owner);
+    write_var_int(out, group.members.len() as u32);
+    for member in &group.members {
+        write_profile(out, &member.profile);
+        write_bytes(out, &member.key);
+    }
+    write_var_int(out, group.unread);
+}
+
+fn write_group_entry(out: &mut Vec<u8>, entry: &GroupEntry) {
+    write_uuid(out, entry.from);
+    out.extend_from_slice(&entry.time.to_be_bytes());
+    out.extend_from_slice(&entry.nonce);
+    write_bytes(out, &entry.ciphertext);
+}
+
 fn write_entry(out: &mut Vec<u8>, entry: &ChatEntry) {
     out.push(entry.outgoing as u8);
     out.extend_from_slice(&entry.time.to_be_bytes());
     out.extend_from_slice(&entry.nonce);
     write_bytes(out, &entry.ciphertext);
+}
+
+/// Group names are shown as entered, so only control characters and surrounding spaces are rejected.
+pub fn is_valid_group_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.trim() == name && !name.chars().any(char::is_control)
 }
 
 pub fn is_valid_name(name: &str) -> bool {
