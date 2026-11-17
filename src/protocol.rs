@@ -11,7 +11,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bumped whenever a change would break older clients.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Upper bound for frames sent by clients. The largest one is a group message, encrypted once per member.
 pub const MAX_CLIENT_FRAME: usize = 16 * 1024;
@@ -24,6 +24,8 @@ pub const MAX_HISTORY_PAGE: usize = 50;
 pub const MAX_GROUP_NAME_LENGTH: usize = 24;
 pub const MAX_GROUP_MEMBERS: usize = 10;
 pub const MAX_WORLD_NAME_LENGTH: usize = 64;
+pub const MAX_SHARED_PACKS: usize = 20;
+pub const MAX_PACK_NAME_LENGTH: usize = 128;
 
 pub type Nonce = [u8; NONCE_LENGTH];
 
@@ -145,6 +147,25 @@ pub enum Serverbound {
         world: WorldId,
         uuid: Uuid,
     },
+    /// The resource packs the host shares with guests of the hosted world.
+    SetHostPacks {
+        packs: Vec<PackInfo>,
+    },
+    /// A guest asks for one of the host's shared packs.
+    RequestPack {
+        host: Uuid,
+        hash: PackHash,
+    },
+}
+
+/// SHA-1 of the pack's zip file, as Minecraft uses for server resource packs.
+pub type PackHash = [u8; 20];
+
+#[derive(Debug, Clone)]
+pub struct PackInfo {
+    pub hash: PackHash,
+    pub name: String,
+    pub size: u64,
 }
 
 #[derive(Debug)]
@@ -261,6 +282,25 @@ pub enum Clientbound {
     WorldMembers {
         world: WorldId,
         members: Vec<Profile>,
+    },
+    /// The packs of a world the player joins.
+    HostPacks {
+        host: Uuid,
+        packs: Vec<PackInfo>,
+    },
+    /// Tells the host to send a pack through the tunnel with this ticket.
+    PackUpload {
+        guest: Profile,
+        hash: PackHash,
+        ticket: u128,
+        port: u16,
+    },
+    /// Tells the guest to receive a pack through the tunnel with this ticket.
+    PackDownload {
+        host: Uuid,
+        hash: PackHash,
+        ticket: u128,
+        port: u16,
     },
 }
 
@@ -482,6 +522,20 @@ impl Serverbound {
             27 => Serverbound::RequestWorldMembers { world: r.uuid()? },
             28 => Serverbound::AddWorldMember { world: r.uuid()?, uuid: r.uuid()? },
             29 => Serverbound::RemoveWorldMember { world: r.uuid()?, uuid: r.uuid()? },
+            30 => {
+                let count = r.var_int()? as usize;
+                if count > MAX_SHARED_PACKS {
+                    return Err(ReadError::Malformed("too many packs"));
+                }
+                let mut packs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let hash = r.hash()?;
+                    let name = r.string(MAX_PACK_NAME_LENGTH)?;
+                    packs.push(PackInfo { hash, name, size: r.u64()? });
+                }
+                Serverbound::SetHostPacks { packs }
+            }
+            31 => Serverbound::RequestPack { host: r.uuid()?, hash: r.hash()? },
             _ => return Err(ReadError::Malformed("packet id")),
         };
         if !r.data.is_empty() {
@@ -539,6 +593,30 @@ impl Clientbound {
                 write_uuid(out, *uuid);
                 out.push(*online as u8);
                 out.extend_from_slice(&last_seen.to_be_bytes());
+            }
+            Clientbound::HostPacks { host, packs } => {
+                out.push(25);
+                write_uuid(out, *host);
+                write_var_int(out, packs.len() as u32);
+                for pack in packs {
+                    out.extend_from_slice(&pack.hash);
+                    write_string(out, &pack.name);
+                    out.extend_from_slice(&pack.size.to_be_bytes());
+                }
+            }
+            Clientbound::PackUpload { guest, hash, ticket, port } => {
+                out.push(26);
+                write_profile(out, guest);
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&ticket.to_be_bytes());
+                out.extend_from_slice(&port.to_be_bytes());
+            }
+            Clientbound::PackDownload { host, hash, ticket, port } => {
+                out.push(27);
+                write_uuid(out, *host);
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&ticket.to_be_bytes());
+                out.extend_from_slice(&port.to_be_bytes());
             }
             Clientbound::WorldMembers { world, members } => {
                 out.push(24);
@@ -675,6 +753,10 @@ impl Reader<'_> {
             }
         }
         Err(ReadError::Malformed("var long"))
+    }
+
+    pub fn hash(&mut self) -> Result<PackHash, ReadError> {
+        Ok(self.take(20)?.try_into().unwrap())
     }
 
     pub fn nonce(&mut self) -> Result<Nonce, ReadError> {

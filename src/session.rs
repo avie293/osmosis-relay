@@ -14,8 +14,8 @@ use tokio::time::{Instant, timeout};
 
 use crate::auth;
 use crate::protocol::{
-    self, Clientbound, DisconnectReason, ErrorCode, Friend, GroupId, MAX_HISTORY_PAGE, PROTOCOL_VERSION, Profile,
-    Serverbound, Uuid, WorldId,
+    self, Clientbound, DisconnectReason, ErrorCode, Friend, GroupId, MAX_HISTORY_PAGE, PROTOCOL_VERSION, PackInfo,
+    Profile, Serverbound, Uuid, WorldId,
 };
 use crate::store::{LeaveOutcome, RequestOutcome, Store};
 use crate::tunnel::Tunnels;
@@ -46,6 +46,7 @@ struct Hosting {
     id: WorldId,
     world: String,
     invited: HashSet<Uuid>,
+    packs: Vec<PackInfo>,
 }
 
 pub struct SessionHandle {
@@ -462,7 +463,7 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
         Serverbound::StartHosting { id, world } => {
             // Everyone invited to this world before may come back without a new invite.
             let invited = inner.store.allowed_guests(me, id);
-            let hosting = Hosting { id, world, invited };
+            let hosting = Hosting { id, world, invited, packs: Vec::new() };
             inner.announce_hosting(me, id, &hosting.world, &hosting.invited);
             inner.hosting.insert(me, hosting);
         }
@@ -514,6 +515,26 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
             let message = inner.world_members(me, world);
             inner.send_to(me, message);
         }
+        Serverbound::SetHostPacks { packs } => {
+            if let Some(hosting) = inner.hosting.get_mut(&me) {
+                hosting.packs = packs;
+            }
+        }
+        Serverbound::RequestPack { host, hash } => {
+            let offered = inner
+                .hosting
+                .get(&host)
+                .is_some_and(|h| h.invited.contains(&me) && h.packs.iter().any(|p| p.hash == hash));
+            if !offered {
+                error(&inner, ErrorCode::NotInvited);
+                return Ok(());
+            }
+            let ticket = hub.tunnels.issue();
+            let port = hub.tunnel_port;
+            let guest = inner.store.profile(me);
+            inner.send_to(host, Clientbound::PackUpload { guest, hash, ticket, port });
+            inner.send_to(me, Clientbound::PackDownload { host, hash, ticket, port });
+        }
         Serverbound::JoinWorld { host } => {
             if !inner.hosting.get(&host).is_some_and(|h| h.invited.contains(&me)) {
                 error(&inner, ErrorCode::NotInvited);
@@ -524,6 +545,10 @@ fn handle(hub: &Hub, me: Uuid, message: Serverbound) -> Result<(), &'static str>
             let guest = inner.store.profile(me);
             inner.send_to(host, Clientbound::GuestJoining { guest, ticket, port });
             inner.send_to(me, Clientbound::JoinTicket { host, ticket, port });
+            let packs = inner.hosting.get(&host).map(|h| h.packs.clone()).unwrap_or_default();
+            if !packs.is_empty() {
+                inner.send_to(me, Clientbound::HostPacks { host, packs });
+            }
         }
     }
     Ok(())
